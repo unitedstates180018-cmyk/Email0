@@ -6,19 +6,18 @@ import string
 import re
 import time
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import Command
+from aiogram import Bot, Dispatcher, types
+from aiogram.utils import executor
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 TOKEN = "8201558492:AAEXTj3oTVYVoXml4UonyWXssVDk0Ht27mQ"
 ADMIN_ID = 7096192507
 BASE_URL = "https://api.mail.tm"
 
 FREE_LIMIT = 3
-FREE_EXPIRY = 600
 
 bot = Bot(token=TOKEN, parse_mode="HTML")
-dp = Dispatcher()
+dp = Dispatcher(bot)
 
 # ================= DATABASE =================
 
@@ -37,13 +36,28 @@ async def init_db():
             user_id INTEGER,
             email TEXT,
             token TEXT,
-            created_at INTEGER,
-            last_msg_id TEXT
+            created_at INTEGER
         )
         """)
         await db.commit()
 
-# ================= MAIL =================
+# ================= PREMIUM CHECK =================
+
+async def is_premium(user_id):
+    async with aiosqlite.connect("database.db") as db:
+        async with db.execute(
+            "SELECT premium,premium_expiry FROM users WHERE user_id=?",
+            (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+
+    if not row:
+        return False
+
+    premium, expiry = row
+    return premium == 1 and expiry > int(time.time())
+
+# ================= MAIL SYSTEM =================
 
 async def get_domain():
     async with aiohttp.ClientSession() as session:
@@ -80,127 +94,122 @@ async def get_token(email, password):
             data = await r.json()
             return data.get("token")
 
-def extract_otp(text):
-    otp = re.findall(r'\b\d{4,8}\b', text)
-    return otp[0] if otp else None
-
-# ================= PREMIUM CHECK =================
-
-async def is_premium(user_id):
-    async with aiosqlite.connect("database.db") as db:
-        async with db.execute("SELECT premium,premium_expiry FROM users WHERE user_id=?", (user_id,)) as cur:
-            row = await cur.fetchone()
-
-    if not row:
-        return False
-
-    premium, expiry = row
-    return premium == 1 and expiry > int(time.time())
-
 # ================= MENU =================
 
 def main_menu():
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📩 Generate", callback_data="generate"),
-            InlineKeyboardButton(text="📂 My Emails", callback_data="list")
-        ],
-        [
-            InlineKeyboardButton(text="💎 Buy Premium", callback_data="buy")
-        ]
-    ])
+    kb = InlineKeyboardMarkup()
+    kb.add(
+        InlineKeyboardButton("📩 Generate", callback_data="generate")
+    )
+    kb.add(
+        InlineKeyboardButton("💎 Buy Premium", callback_data="buy")
+    )
     return kb
 
 # ================= START =================
 
-@dp.message(Command("start"))
-async def start_handler(msg: Message):
+@dp.message_handler(commands=["start"])
+async def start_handler(message: types.Message):
     async with aiosqlite.connect("database.db") as db:
-        await db.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (msg.from_user.id,))
+        await db.execute(
+            "INSERT OR IGNORE INTO users(user_id) VALUES(?)",
+            (message.from_user.id,)
+        )
         await db.commit()
 
-    await msg.answer("🚀 <b>Pro Temp Mail Bot</b>", reply_markup=main_menu())
+    await message.answer(
+        "🚀 <b>Pro Temp Mail Bot</b>\n\nFree Limit: 3 Emails\nPremium: Unlimited",
+        reply_markup=main_menu()
+    )
 
 # ================= GENERATE =================
 
-@dp.callback_query(F.data == "generate")
-async def generate_handler(call: CallbackQuery):
+@dp.callback_query_handler(lambda c: c.data == "generate")
+async def generate_handler(call: types.CallbackQuery):
     user_id = call.from_user.id
     premium = await is_premium(user_id)
 
     async with aiosqlite.connect("database.db") as db:
-        async with db.execute("SELECT COUNT(*) FROM emails WHERE user_id=?", (user_id,)) as cur:
+        async with db.execute(
+            "SELECT COUNT(*) FROM emails WHERE user_id=?",
+            (user_id,)
+        ) as cur:
             count = (await cur.fetchone())[0]
 
     if not premium and count >= FREE_LIMIT:
-        await call.message.answer("🚫 Free limit reached (3 emails)")
+        await call.message.answer(
+            "🚫 Free limit reached (3 emails).\nUpgrade to Premium for Unlimited."
+        )
         return
 
     email, password = await create_account()
     token = await get_token(email, password)
 
     async with aiosqlite.connect("database.db") as db:
-        await db.execute("""
-        INSERT INTO emails(user_id,email,token,created_at)
-        VALUES(?,?,?,?)
-        """, (user_id, email, token, int(time.time())))
+        await db.execute(
+            "INSERT INTO emails(user_id,email,token,created_at) VALUES(?,?,?,?)",
+            (user_id, email, token, int(time.time()))
+        )
         await db.commit()
 
     await call.message.answer(f"✅ Created:\n<code>{email}</code>")
 
-# ================= BUY =================
+# ================= BUY PREMIUM (INDIA) =================
 
-@dp.callback_query(F.data == "buy")
-async def buy_handler(call: CallbackQuery):
+@dp.callback_query_handler(lambda c: c.data == "buy")
+async def buy_handler(call: types.CallbackQuery):
     text = """
-💎 <b>Premium Plans</b>
+💎 <b>Premium Plans (India)</b>
 
-7 Days - 99৳
-30 Days - 299৳
+7 Days  - ₹99
+30 Days - ₹299
+90 Days - ₹699
 
-Send payment to:
-bKash: 01XXXXXXXXX
+💳 Payment Methods:
+
+🔹 UPI ID: yourupi@oksbi
+🔹 Google Pay
+🔹 PhonePe
+🔹 Paytm
 
 After payment send screenshot to admin.
+
+⚡ Premium = Unlimited Emails
 """
     await call.message.answer(text)
 
 # ================= ADMIN APPROVE =================
 
-@dp.message(Command("approve"))
-async def approve_handler(msg: Message):
-    if msg.from_user.id != ADMIN_ID:
+@dp.message_handler(commands=["approve"])
+async def approve_handler(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
         return
 
     try:
-        user_id = int(msg.text.split()[1])
-        days = int(msg.text.split()[2])
+        user_id = int(message.text.split()[1])
+        days = int(message.text.split()[2])
     except:
-        await msg.reply("Usage: /approve user_id days")
+        await message.reply("Usage: /approve user_id days")
         return
 
     expiry = int(time.time()) + days * 86400
 
     async with aiosqlite.connect("database.db") as db:
-        await db.execute("""
-        UPDATE users SET premium=1,premium_expiry=? WHERE user_id=?
-        """, (expiry, user_id))
+        await db.execute(
+            "UPDATE users SET premium=1,premium_expiry=? WHERE user_id=?",
+            (expiry, user_id)
+        )
         await db.commit()
 
-    await bot.send_message(user_id, f"🎉 Premium Activated for {days} days!")
-
-# ================= OTP CHECKER =================
-
-async def otp_checker():
-    while True:
-        await asyncio.sleep(3)
+    await bot.send_message(
+        user_id,
+        f"🎉 Premium Activated for {days} days!"
+    )
 
 # ================= RUN =================
 
-async def main():
+async def on_startup(dp):
     await init_db()
-    asyncio.create_task(otp_checker())
-    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    executor.start_polling(dp, on_startup=on_startup)
