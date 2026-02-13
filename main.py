@@ -1,89 +1,61 @@
-import telebot
-import requests
+import asyncio
+import aiohttp
+import aiosqlite
 import random
 import string
 import re
-import json
-import os
 import time
-import threading
-from flask import Flask
 
-# ================= CONFIG =================
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
 
 TOKEN = "8201558492:AAEXTj3oTVYVoXml4UonyWXssVDk0Ht27mQ"
-ADMIN_ID = "7096192507"
-
+ADMIN_ID = 7096192507
 BASE_URL = "https://api.mail.tm"
-DATA_FILE = "data.json"
 
-EXPIRY_TIME = 600
-CHECK_INTERVAL = 5
 FREE_LIMIT = 3
+FREE_EXPIRY = 600
 
-# =========================================
+bot = Bot(token=TOKEN, parse_mode="HTML")
+dp = Dispatcher()
 
-bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
-app = Flask(__name__)
-START_TIME = time.time()
+# ================= DATABASE =================
 
-# ================= DATA ==================
+async def init_db():
+    async with aiosqlite.connect("database.db") as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            premium INTEGER DEFAULT 0,
+            premium_expiry INTEGER DEFAULT 0
+        )
+        """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS emails (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            email TEXT,
+            token TEXT,
+            created_at INTEGER,
+            last_msg_id TEXT
+        )
+        """)
+        await db.commit()
 
-if os.path.exists(DATA_FILE):
-    with open(DATA_FILE, "r") as f:
-        user_data = json.load(f)
-else:
-    user_data = {}
+# ================= MAIL =================
 
-def save_data():
-    with open(DATA_FILE, "w") as f:
-        json.dump(user_data, f)
+async def get_domain():
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f"{BASE_URL}/domains") as r:
+            data = await r.json()
+            domains = data.get("hydra:member", [])
+            if not domains:
+                return None
+            return random.choice(domains)["domain"]
 
-# ================= DASHBOARD ==============
-
-@app.route("/")
-def dashboard():
-    total_users = len(user_data)
-    total_emails = sum(len(v["emails"]) for v in user_data.values())
-    uptime = int(time.time() - START_TIME)
-
-    return f"""
-<html>
-<head>
-<meta http-equiv="refresh" content="5">
-<style>
-body {{background:#111;color:#fff;text-align:center;font-family:sans-serif}}
-.box {{background:#222;margin:20px;padding:20px;border-radius:10px}}
-</style>
-</head>
-<body>
-<h1>🚀 Live Dashboard</h1>
-<div class='box'>👥 Users: {total_users}</div>
-<div class='box'>📧 Emails: {total_emails}</div>
-<div class='box'>⏳ Uptime: {uptime} sec</div>
-</body>
-</html>
-"""
-
-def run_dashboard():
-    app.run(host="0.0.0.0", port=5000)
-
-threading.Thread(target=run_dashboard, daemon=True).start()
-
-# ================= MAIL FUNCTIONS =========
-
-def get_domain():
-    try:
-        r = requests.get(f"{BASE_URL}/domains")
-        domains = r.json().get("hydra:member", [])
-        if not domains:
-            return None
-        return random.choice(domains)["domain"]
-    except:
-        return None
-
-def create_account():
-    domain = get_domain()
+async def create_account():
+    domain = await get_domain()
     if not domain:
         return None, None
 
@@ -91,227 +63,144 @@ def create_account():
     email = f"{username}@{domain}"
     password = "Pass123456"
 
-    requests.post(f"{BASE_URL}/accounts", json={
-        "address": email,
-        "password": password
-    })
-
-    return email, password
-
-def get_token(email, password):
-    try:
-        r = requests.post(f"{BASE_URL}/token", json={
+    async with aiohttp.ClientSession() as session:
+        await session.post(f"{BASE_URL}/accounts", json={
             "address": email,
             "password": password
         })
-        return r.json().get("token")
-    except:
-        return None
 
-def get_messages(token):
-    try:
-        headers = {"Authorization": f"Bearer {token}"}
-        r = requests.get(f"{BASE_URL}/messages", headers=headers)
-        return r.json().get("hydra:member", [])
-    except:
-        return []
+    return email, password
 
-def read_message(token, msg_id):
-    try:
-        headers = {"Authorization": f"Bearer {token}"}
-        r = requests.get(f"{BASE_URL}/messages/{msg_id}", headers=headers)
-        return r.json()
-    except:
-        return {}
+async def get_token(email, password):
+    async with aiohttp.ClientSession() as session:
+        async with session.post(f"{BASE_URL}/token", json={
+            "address": email,
+            "password": password
+        }) as r:
+            data = await r.json()
+            return data.get("token")
 
 def extract_otp(text):
     otp = re.findall(r'\b\d{4,8}\b', text)
     return otp[0] if otp else None
 
-# ================= AUTO OTP ===============
+# ================= PREMIUM CHECK =================
 
-def auto_otp_checker():
-    while True:
-        time.sleep(CHECK_INTERVAL)
-        for user_id in list(user_data.keys()):
-            for email_data in user_data[user_id]["emails"]:
-                token = email_data["token"]
-                last_id = email_data.get("last_msg_id")
+async def is_premium(user_id):
+    async with aiosqlite.connect("database.db") as db:
+        async with db.execute("SELECT premium,premium_expiry FROM users WHERE user_id=?", (user_id,)) as cur:
+            row = await cur.fetchone()
 
-                messages = get_messages(token)
-                if not messages:
-                    continue
+    if not row:
+        return False
 
-                latest_id = messages[0]["id"]
-                if latest_id == last_id:
-                    continue
+    premium, expiry = row
+    return premium == 1 and expiry > int(time.time())
 
-                msg = read_message(token, latest_id)
-                body = msg.get("text", "") or msg.get("html", "")
-                otp = extract_otp(body)
-
-                if otp:
-                    bot.send_message(
-                        user_id,
-                        f"🔔 <b>New OTP</b>\n📩 {email_data['email']}\n🔐 <code>{otp}</code>"
-                    )
-
-                email_data["last_msg_id"] = latest_id
-                save_data()
-
-threading.Thread(target=auto_otp_checker, daemon=True).start()
-
-# ================= EXPIRY =================
-
-def expiry_checker():
-    while True:
-        time.sleep(60)
-        now = time.time()
-
-        for user_id in list(user_data.keys()):
-            for email in list(user_data[user_id]["emails"]):
-                if now - email["created_at"] > EXPIRY_TIME:
-                    user_data[user_id]["emails"].remove(email)
-                    bot.send_message(
-                        user_id,
-                        f"⏰ Expired: {email['email']}"
-                    )
-        save_data()
-
-threading.Thread(target=expiry_checker, daemon=True).start()
-
-# ================= MENU ===================
+# ================= MENU =================
 
 def main_menu():
-    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        telebot.types.InlineKeyboardButton("📩 Generate", callback_data="generate"),
-        telebot.types.InlineKeyboardButton("📂 My Emails", callback_data="list")
-    )
-    return markup
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📩 Generate", callback_data="generate"),
+            InlineKeyboardButton(text="📂 My Emails", callback_data="list")
+        ],
+        [
+            InlineKeyboardButton(text="💎 Buy Premium", callback_data="buy")
+        ]
+    ])
+    return kb
 
-# ================= START ==================
+# ================= START =================
 
-@bot.message_handler(commands=['start'])
-def start(message):
-    user_id = str(message.chat.id)
+@dp.message(Command("start"))
+async def start_handler(msg: Message):
+    async with aiosqlite.connect("database.db") as db:
+        await db.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (msg.from_user.id,))
+        await db.commit()
 
-    if user_id not in user_data:
-        user_data[user_id] = {
-            "premium": False,
-            "emails": []
-        }
+    await msg.answer("🚀 <b>Pro Temp Mail Bot</b>", reply_markup=main_menu())
 
-    save_data()
+# ================= GENERATE =================
 
-    bot.send_message(
-        user_id,
-        "✨ <b>Premium Temp Mail Bot</b>",
-        reply_markup=main_menu()
-    )
+@dp.callback_query(F.data == "generate")
+async def generate_handler(call: CallbackQuery):
+    user_id = call.from_user.id
+    premium = await is_premium(user_id)
 
-# ================= ADMIN ==================
+    async with aiosqlite.connect("database.db") as db:
+        async with db.execute("SELECT COUNT(*) FROM emails WHERE user_id=?", (user_id,)) as cur:
+            count = (await cur.fetchone())[0]
 
-@bot.message_handler(commands=['admin'])
-def admin_panel(message):
-    user_id = str(message.chat.id)
-
-    if user_id != ADMIN_ID:
-        bot.send_message(user_id, "⛔ Access Denied")
+    if not premium and count >= FREE_LIMIT:
+        await call.message.answer("🚫 Free limit reached (3 emails)")
         return
 
-    total_users = len(user_data)
-    total_emails = sum(len(v["emails"]) for v in user_data.values())
-    uptime = int(time.time() - START_TIME)
+    email, password = await create_account()
+    token = await get_token(email, password)
 
-    bot.send_message(
-        user_id,
-        f"👑 Admin Panel\n\nUsers: {total_users}\nEmails: {total_emails}\nUptime: {uptime}s"
-    )
+    async with aiosqlite.connect("database.db") as db:
+        await db.execute("""
+        INSERT INTO emails(user_id,email,token,created_at)
+        VALUES(?,?,?,?)
+        """, (user_id, email, token, int(time.time())))
+        await db.commit()
 
-# ================= CALLBACK ===============
+    await call.message.answer(f"✅ Created:\n<code>{email}</code>")
 
-@bot.callback_query_handler(func=lambda call: True)
-def callback(call):
-    user_id = str(call.message.chat.id)
+# ================= BUY =================
 
-    if call.data == "generate":
+@dp.callback_query(F.data == "buy")
+async def buy_handler(call: CallbackQuery):
+    text = """
+💎 <b>Premium Plans</b>
 
-        if not user_data[user_id]["premium"] and \
-        len(user_data[user_id]["emails"]) >= FREE_LIMIT:
-            bot.send_message(user_id, "🚫 Free limit reached (3 emails).")
-            return
+7 Days - 99৳
+30 Days - 299৳
 
-        email, password = create_account()
+Send payment to:
+bKash: 01XXXXXXXXX
 
-        if not email:
-            bot.send_message(user_id, "❌ Email creation failed")
-            return
+After payment send screenshot to admin.
+"""
+    await call.message.answer(text)
 
-        token = get_token(email, password)
-        if not token:
-            bot.send_message(user_id, "❌ Token failed")
-            return
+# ================= ADMIN APPROVE =================
 
-        user_data[user_id]["emails"].append({
-            "email": email,
-            "token": token,
-            "created_at": time.time(),
-            "last_msg_id": None
-        })
+@dp.message(Command("approve"))
+async def approve_handler(msg: Message):
+    if msg.from_user.id != ADMIN_ID:
+        return
 
-        save_data()
+    try:
+        user_id = int(msg.text.split()[1])
+        days = int(msg.text.split()[2])
+    except:
+        await msg.reply("Usage: /approve user_id days")
+        return
 
-        bot.send_message(
-            user_id,
-            f"✅ Created:\n<code>{email}</code>",
-            reply_markup=main_menu()
-        )
+    expiry = int(time.time()) + days * 86400
 
-    elif call.data == "list":
+    async with aiosqlite.connect("database.db") as db:
+        await db.execute("""
+        UPDATE users SET premium=1,premium_expiry=? WHERE user_id=?
+        """, (expiry, user_id))
+        await db.commit()
 
-        if not user_data[user_id]["emails"]:
-            bot.send_message(user_id, "📭 No emails")
-            return
+    await bot.send_message(user_id, f"🎉 Premium Activated for {days} days!")
 
-        for i, data in enumerate(user_data[user_id]["emails"]):
-            markup = telebot.types.InlineKeyboardMarkup()
-            markup.add(
-                telebot.types.InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{i}"),
-                telebot.types.InlineKeyboardButton("🗑 Delete", callback_data=f"delete_{i}")
-            )
+# ================= OTP CHECKER =================
 
-            bot.send_message(
-                user_id,
-                f"📩 <code>{data['email']}</code>",
-                reply_markup=markup
-            )
+async def otp_checker():
+    while True:
+        await asyncio.sleep(3)
 
-    elif call.data.startswith("delete_"):
-        index = int(call.data.split("_")[1])
-        deleted = user_data[user_id]["emails"].pop(index)
-        save_data()
-        bot.send_message(user_id, f"🗑 Deleted {deleted['email']}")
+# ================= RUN =================
 
-    elif call.data.startswith("refresh_"):
-        index = int(call.data.split("_")[1])
-        data = user_data[user_id]["emails"][index]
+async def main():
+    await init_db()
+    asyncio.create_task(otp_checker())
+    await dp.start_polling(bot)
 
-        messages = get_messages(data["token"])
-        if not messages:
-            bot.send_message(user_id, "📭 No messages")
-            return
-
-        msg = read_message(data["token"], messages[0]["id"])
-        body = msg.get("text", "") or msg.get("html", "")
-        otp = extract_otp(body) or "No OTP"
-
-        bot.send_message(
-            user_id,
-            f"📩 {data['email']}\n🔐 <code>{otp}</code>"
-        )
-
-# ================= RUN ====================
-
-print("Ultimate Bot Running...")
-bot.infinity_polling()
+if __name__ == "__main__":
+    asyncio.run(main())
